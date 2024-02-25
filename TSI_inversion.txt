@@ -1,0 +1,301 @@
+//This code is design for google earth engine
+//export tif data
+function expData(TSI,taskName,roi,crs,scale,year){
+    Export.image.toDrive({
+    image: TSI,
+    description: taskName,
+    region:roi,
+    crs:crs,
+    scale:scale});
+    return;
+	}
+
+//define OTSU method
+function otsu1(histogram) {
+    var counts = ee.Array(ee.Dictionary(histogram).get('histogram'));
+    var means = ee.Array(ee.Dictionary(histogram).get('bucketMeans'));
+    var size = means.length().get([0]);
+    var total = counts.reduce(ee.Reducer.sum(), [0]).get([0]);
+    var sum = means.multiply(counts).reduce(ee.Reducer.sum(), [0]).get([0]);
+    var mean = sum.divide(total);
+    var indices = ee.List.sequence(1, size);
+    var bss = indices.map(function (i) {
+        var aCounts = counts.slice(0, 0, i);
+        var aCount = aCounts.reduce(ee.Reducer.sum(), [0]).get([0]);
+        var aMeans = means.slice(0, 0, i);
+        var aMean = aMeans.multiply(aCounts)
+            .reduce(ee.Reducer.sum(), [0]).get([0])
+            .divide(aCount);
+        var bCount = total.subtract(aCount);
+        var bMean = sum.subtract(aCount.multiply(aMean)).divide(bCount);
+        return aCount.multiply(aMean.subtract(mean).pow(2)).add(
+            bCount.multiply(bMean.subtract(mean).pow(2)));
+    });
+
+    return means
+        .sort(bss)
+        .get([-1]);
+}
+
+function otsu(image,geometry) {
+    var histogram = image.reduceRegion({
+        reducer: ee.Reducer.histogram(1000, 0.01),
+        geometry: geometry,
+        scale: 30,
+        bestEffort: true,
+    });
+    return otsu1(histogram.get(histogram.keys().get(0)));
+}
+
+//rename band name of Landsat-8 and 9 
+function bandRenameL89(image) {
+  var blue = image.select(['SR_B2']).rename('blue');
+  var green = image.select(['SR_B3']).rename('green');
+  var red = image.select(['SR_B4']).rename('red');
+  var nir = image.select(['SR_B5']).rename('nir');
+  var swir1 = image.select(['SR_B6']).rename('swir1');
+  var swir2 = image.select(['SR_B7']).rename('swir2');
+  var new_image = blue.addBands([green, red, nir, swir1, swir2]);
+  return new_image;
+}
+
+//rename band name of Landsat-4, 5 and 7 
+function bandRenameL457(image) {
+  var blue = image.select(['SR_B1']).rename('blue');
+  var green = image.select(['SR_B2']).rename('green');
+  var red = image.select(['SR_B3']).rename('red');
+  var nir = image.select(['SR_B4']).rename('nir');
+  var swir1 = image.select(['SR_B5']).rename('swir1');
+  var swir2 = image.select(['SR_B7']).rename('swir2');
+  var new_image = blue.addBands([green, red, nir, swir1, swir2]);
+  return new_image;
+}
+
+//apply scale factors to Landsat-8 and 9 
+function applyScaleFactorsL89(image) {
+  var opticalBands = image.select('SR_B.').multiply(0.0000275).add(-0.2);
+  var thermalBands = image.select('ST_B.*').multiply(0.00341802).add(149.0);
+  return image.addBands(opticalBands, null, true)
+              .addBands(thermalBands, null, true);
+}
+
+//apply scale factors to Landsat-4,5 and 7 
+function applyScaleFactorsL457(image) {
+  var opticalBands = image.select('SR_B.').multiply(0.0000275).add(-0.2);
+  var thermalBand = image.select('ST_B.*').multiply(0.00341802).add(149.0);
+  return image.addBands(opticalBands, null, true)
+              .addBands(thermalBand, null, true);
+}
+
+function cloudmaskL89(image) {
+  // Bits 3 and 5 are cloud shadow and cloud, respectively.
+  var cloudShadowBitMask = (1 << 4);
+  var cloudsBitMask = (1 << 3);
+  // Get the pixel QA band.
+  var qa = image.select('QA_PIXEL');
+  // Both flags should be set to zero, indicating clear conditions.
+  var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0)
+                 .and(qa.bitwiseAnd(cloudsBitMask).eq(0));
+  return image.updateMask(mask);
+}
+
+function cloudMaskL457(image) {
+  var qa = image.select('QA_PIXEL');
+  // If the cloud bit (5) is set and the cloud confidence (7) is high
+  // or the cloud shadow bit is set (3), then it's a bad pixel.
+  var cloud = qa.bitwiseAnd(1 << 3)
+                  .and(qa.bitwiseAnd(1 << 9))
+                  .or(qa.bitwiseAnd(1 << 4));
+  // Remove edge pixels that don't occur in all bands
+  var mask2 = image.mask().reduce(ee.Reducer.min());
+  return image.updateMask(cloud.not()).updateMask(mask2);
+}
+
+// get image collection
+function getLandSatImageCol(roi, start_date, end_date, cloudCover) {
+  // landsat 9
+  var l9_col = ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
+                    .filterBounds(roi)
+                    .filterDate(start_date, end_date)
+                    .filter(ee.Filter.lt('CLOUD_COVER', cloudCover))
+                    .map(applyScaleFactorsL89)
+                    .map(cloudmaskL89)
+                    .map(bandRenameL89)
+                    ;
+  // landsat 8
+  var l8_col = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+                    .filterBounds(roi)
+                    .filterDate(start_date, end_date)
+                    .filter(ee.Filter.lt('CLOUD_COVER', cloudCover))
+                    .map(applyScaleFactorsL89)
+                    .map(cloudmaskL89)
+                    .map(bandRenameL89)
+                    ;
+  // landsat 7
+  var l7_col = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
+                    .filterBounds(roi)
+                    .filterDate(start_date, end_date)
+                    .filter(ee.Filter.lt('CLOUD_COVER', cloudCover))
+                    .map(applyScaleFactorsL457)
+                    .map(cloudMaskL457)
+                    .map(bandRenameL457)
+                    ;
+  // landsat 5
+  var l5_col = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2')
+                    .filterBounds(roi)
+                    .filterDate(start_date, end_date)
+                    .filter(ee.Filter.lt('CLOUD_COVER', cloudCover))
+                    .map(applyScaleFactorsL457)
+                    .map(cloudMaskL457)
+                    .map(bandRenameL457)
+                    ;
+  // landsat 4
+  var l4_col = ee.ImageCollection('LANDSAT/LT04/C02/T1_L2')
+                    .filterBounds(roi)
+                    .filterDate(start_date, end_date)
+                    .filter(ee.Filter.lt('CLOUD_COVER', cloudCover))
+                    .map(applyScaleFactorsL457)
+                    .map(cloudMaskL457)
+                    .map(bandRenameL457)
+                    ;
+// combine, mean and calculate
+  var imageCol = l9_col
+              .merge(l8_col)
+              .merge(l7_col)
+              .merge(l5_col)
+              .merge(l4_col)
+              ;
+  var imageCol2 = imageCol.sort("CLOUD_COVER");
+  return imageCol2;
+}	
+
+//bulid TSI model
+function calTSI(image,geo) {
+ var blue = image.select("blue");
+ var green = image.select("green");
+ var red = image.select("red");
+ var nir = image.select("nir");
+ var swir1 = image.select("swir1");
+ 
+ var mndwi = image.expression(
+   "(green - swir1)/(green + swir1)",
+   {
+     "green": green,
+     "swir1": swir1
+   }
+ ).rename("mndwi");
+ 
+  var cwi = image.expression(
+   "blue - green",
+   {
+     "blue": blue,
+     "green": green
+   }
+  );
+ 
+  var twi = image.expression(
+   "red - swir1",
+   {
+     "red": red,
+     "swir1": swir1
+   }
+  );
+  
+  var abi = image.expression(
+   "((green-blue)-(nir-blue)*(561-482)/(865-482))-((green-blue)-(red-blue)*(561-482)/(655-482))",
+   {
+     "blue": blue,
+     "green": green,
+     "red": red,
+     "nir": nir
+   }
+  ).rename("abi");
+  
+  function formulaET(image) {
+    var ABI = image.select("abi");
+    var TSI = image.expression(
+      "72.86-628.21*ABI",
+      {
+        "ABI": ABI,
+      }
+      );
+    return TSI;
+  }
+  
+  function formulaMT(img) {
+    var ABI = img.select("abi");
+    var TSI = img.expression(
+      "55.76-355.82*ABI",
+      {
+        "ABI": ABI,
+      }
+      );
+    return TSI;
+  }
+  
+  function formulaOT(image) {
+    var ABI = image.select("abi");
+    var TSI = image.expression(
+      "16.23-111.99*ABI",
+      {
+        "ABI": ABI,
+      }
+      );
+    return TSI;
+  }
+  
+  var new_image = image.addBands([mndwi, cwi, twi, abi]);
+  var waterZone = new_image.select("mndwi");
+  var yuzhi = otsu(mndwi,geo);
+  var water = mndwi.gt(yuzhi);
+  Map.addLayer(water.randomVisualizer(), "", "water");
+
+  var result = waterZone.where(mndwi.gt(yuzhi).and(green.gt(0.11)).and(cwi.lte(0)).and(twi.lt(0.074)), formulaET(new_image))
+                .where(mndwi.gt(yuzhi).and(green.gt(0.11)).and(cwi.lte(0)).and(twi.gte(0.074)), formulaMT(new_image))
+                .where(mndwi.gt(yuzhi).and(green.gt(0.11)).and(cwi.gt(0)), formulaOT(new_image))
+                .where(mndwi.gt(yuzhi).and(green.lte(0.11)), formulaOT(new_image))
+                .rename("tsi");
+
+  return result;
+}
+
+var lakes=ee.FeatureCollection("path/folder/shapefile_name");
+var lakenum = lakes.size();
+var lakeNames = lakes.reduceColumns(ee.Reducer.toList(), ["attribute of shp"])
+                       .get("list");
+    
+print('lakeNum',lakenum);
+
+var lst = ee.List([]);
+
+//main entrance
+lakeNames.evaluate(function(names){
+  for (var i=0; i<names.length; i++){
+    var name = names[i];  
+    var feature = lakes.filter(ee.Filter.eq("attribute of shp", name)).first();
+    var Name = feature.get('attribute of shp');
+    var geo = feature.geometry();
+    
+    //define year for TSI inversion
+    var year = 2023;
+    var start_date = year+'-01-01';
+    var end_date = year+'-12-31';
+    var cloudCover = 30;
+    var collection_ini = getLandSatImageCol(geo,start_date, end_date, cloudCover);
+    
+    //pick summertimee
+    var Time_Filter = ee.Filter.calendarRange(150,240,'day_of_year'); 
+    var collection = collection_ini.filter(Time_Filter);
+    
+    //Composite the data with median method
+    var composite = collection.median();
+    var final_image = composite.clip(geo);
+    
+    var image_tsi = calTSI(final_image,geo);
+    
+    var crs = 'EPSG:4326';
+    var scale = 30;
+    var title = i+'_TSI_'+year;
+    expData(image_tsi,title,geo,crs,scale,year);
+  }
+});
